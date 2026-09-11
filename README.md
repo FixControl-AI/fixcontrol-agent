@@ -57,7 +57,16 @@ cosign verify "$FC_AGENT_IMAGE" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Each release also ships CycloneDX SBOMs (`*.cdx.json`) and
+The CycloneDX SBOM is attested against the image as well, so it can be
+verified rather than merely downloaded:
+
+```sh
+cosign verify-attestation --type cyclonedx "$FC_AGENT_IMAGE" \
+  --certificate-identity-regexp '^https://github.com/FixControl-AI/fixcontrol-agent/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Each release also ships those SBOMs as files (`*.cdx.json`) and
 `image-manifest.json` listing every digest.
 
 **Building the images yourself** — for an air-gapped estate, or because you
