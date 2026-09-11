@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# fc-agent, minus the two things only the customer can supply: the namespace
+# and the image digest. Both are bound by install/install.sh (or by a
+# checked-in overlay). This base is not applyable on its own — see the header
+# of fc-agent.yaml for why that is deliberate.
+
+resources:
+  - fc-agent.yaml
+  - networkpolicy.yaml

@@ -1,0 +1,54 @@
+---
+# fc-agent egress. NO ingress rule at all: the agent ships no Service and its
+# health/metrics listener binds 127.0.0.1. That absence IS the design (plan
+# invariant 1) — do not add an ingress rule here "for convenience".
+#
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ THIS BASE IS THE FLOOR, NOT THE FINISHED POLICY.                       ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+# It carries the two destinations every install needs — cluster DNS and the
+# Kubernetes API — and NOTHING else, so a rendering mistake fails closed: an
+# agent that cannot reach FixControl reports 503 on /healthz and refuses
+# nothing silently.
+#
+# install.sh REPLACES `spec.egress` wholesale with the destinations named in
+# values.env (FixControl, the git forge, the CI hosts, the in-cluster
+# receiver). A strategic-merge patch on a NetworkPolicy `egress` list has no
+# merge key, so the replacement is total and predictable — what you read in the
+# render is exactly what is applied.
+#
+# The stance to keep when editing: the agent holds the tenant's agent secret,
+# the manifests-repo PAT and (with Phase 3) the customer's GitLab/Jenkins
+# credentials. A broad egress rule turns any code execution in this pod into
+# arbitrary outbound reach with three credentials attached. Name every
+# destination. Never 0.0.0.0/0.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fc-agent-egress
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  podSelector:
+    matchLabels: { app: fc-agent }
+  policyTypes: [Egress]
+  egress:
+    # 1. Cluster DNS — resolve the FixControl hostname and the git forge.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # 2. The kube-apiserver — the agent reads Rollouts and writes its nonce
+    #    ConfigMap over the SA token. NetworkPolicy cannot target the apiserver
+    #    Service by selector, so this is an ipBlock; install.sh reads the real
+    #    ClusterIP of `kubernetes.default` and patches it, defaulting to the
+    #    10.96.0.1/32 that the default service CIDR yields.
+    - to:
+        - ipBlock: { cidr: 10.96.0.1/32 }
+      ports:
+        - { protocol: TCP, port: 443 }

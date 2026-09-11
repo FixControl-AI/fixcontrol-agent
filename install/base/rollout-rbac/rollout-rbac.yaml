@@ -1,0 +1,85 @@
+---
+# fc-rollout-controller RBAC — one Role + RoleBinding PER ROLLOUT NAMESPACE.
+#
+# This base is applied once for every namespace listed in
+# `FC_ROLLOUT_NAMESPACES` (default: `FC_ALLOWED_NAMESPACES`) in values.env. The
+# ServiceAccount lives in the agent's own namespace; the grants live where the
+# Rollouts live. Those are usually different namespaces, and keeping them
+# separate is the point: the agent's namespace can be locked down as a
+# FixControl-owned namespace without also being the place production workloads
+# run.
+#
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ Every rule, and why it exists. Anything not listed here is denied by   ║
+# ║ RBAC's deny-by-default, and that absence IS the enforcement.           ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+#
+#   argoproj.io/rollouts  get   → check 7, the live-revision pin
+#                                 (`read_rollout` in bin/agent.py), and the
+#                                 whole of `rollout.status`.
+#   argoproj.io/rollouts  list  → the EVENTS_ENABLED=1 diff loop, which GETs
+#                                 the rollouts collection per allowlisted
+#                                 namespace (`poll_events` in bin/agent.py).
+#                                 Drop this rule if EVENTS_ENABLED=0 — see
+#                                 FC_EVENTS_ENABLED in values.env, which makes
+#                                 install.sh omit it.
+#
+# ── Grants REMOVED in the packaging pass (2026-08-23), with evidence ──────
+#
+#   argoproj.io/rollouts         watch   — REMOVED. No code path opens a watch:
+#     v1 polls on POLL_SECONDS and the connectivity plan lists "watch is a
+#     latency optimization" as an open follow-up. Verified by
+#     scripts/smoke-rbac-code-parity.py, which fails if a watch ever appears in
+#     bin/agent.py without the grant coming back.
+#
+#   argoproj.io/rollouts/promote create/update/patch — REMOVED, and this is the
+#     biggest one. The agent NEVER writes the promote subresource. Promotion is
+#     either a GitOps marker commit (PROMOTE_MODE=git, the default) or a
+#     forward to the in-cluster fc-receiver (PROMOTE_MODE=receiver); grep
+#     `rollout_path` in bin/agent.py and the only write is `…/status`. The
+#     grant was inherited from fc-receiver's Role, where it IS used, and it
+#     handed the agent identity a live production-mutation path that nothing
+#     in the agent could reach. Removing it is not a behaviour change; it is
+#     the deletion of a dead grant that a compromise could have used.
+#
+#   argoproj.io/rollouts/status  get/update — REMOVED. The abort path issues
+#     exactly one call, a PATCH, and only when ARGO_LOCAL_API=1. `get` on a
+#     subresource bought nothing (`read_rollout` reads the main object) and
+#     `update` is a full-object write where a PATCH suffices.
+#
+# ── The one conditional rule ──────────────────────────────────────────────
+# `rollouts/status: patch` is added by install.sh ONLY when
+# FC_ARGO_LOCAL_API=1. With the default (0) this identity holds NO write verb
+# against argoproj.io anywhere in the cluster — a `rollout.abort` that would
+# need the local API is refused `capability_denied` by the agent itself
+# (acceptance criterion 6), and would be refused by RBAC as well if the agent
+# were compromised into trying. Two independent statements of the same rule.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-rollout-controller
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-rollout-controller
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+subjects:
+  - kind: ServiceAccount
+    name: fc-rollout-controller
+    # namespace: the AGENT's namespace, written by install.sh's render — it is
+    # deliberately not the namespace this Role lives in.
+roleRef:
+  kind: Role
+  name: fc-rollout-controller
+  apiGroup: rbac.authorization.k8s.io

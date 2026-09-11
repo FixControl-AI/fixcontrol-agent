@@ -1,0 +1,289 @@
+---
+# fc-agent — outbound-only FixControl agent (Phase 2a of
+# docs/PLAN-fc-agent-outbound-connectivity.md in the FixControl repo).
+#
+# The whole point of this manifest is what it does NOT contain: no Service, no
+# Ingress, no LoadBalancer, no inbound NetworkPolicy. The agent dials out to
+# FixControl and talks inward to the private Kubernetes/Argo API over ClusterIP.
+# The complete firewall requirement is
+#   egress  customer → api.fixcontrol.ai : 443
+# and the inbound requirement is: none.
+#
+# THIS IS A KUSTOMIZE BASE. It carries no namespace and no image digest on
+# purpose — both are customer values, bound by `install/install.sh` from
+# `values.env` (or by an overlay of your own that checks the same values in).
+# Applying this directory with a bare `kubectl apply -f` will fail, and that
+# failure is the design: an install that has not been through the values step
+# has no FixControl URL, no identity and no pinned image.
+#
+# Identity: ServiceAccount `fc-rollout-controller`, per the plan's
+# "Identities and RBAC — separated by blast radius" table. fc-test-runner is a
+# SEPARATE ServiceAccount in its own namespace that cannot reach argoproj.io at
+# all; compromising the component that runs customer test code must never yield
+# production rollout control.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fc-rollout-controller
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+# The agent IS a Kubernetes API client (it reads Rollouts and writes its nonce
+# ledger), so the token is mounted. Every grant it buys is enumerated below.
+automountServiceAccountToken: true
+
+---
+# ── Nonce store ────────────────────────────────────────────────────────────
+# A SEPARATE Role, scoped by resourceName to exactly one ConfigMap. The agent
+# must refuse a replayed envelope across its own restarts, which needs durable
+# state; granting `configmaps` broadly to buy that would hand the rollout
+# identity a read surface over every ConfigMap in the namespace.
+#
+# Per-rule justification (rule 1 is the only rule):
+#   configmaps[fc-agent-nonces] get     — read the ledger at boot and each poll
+#   configmaps[fc-agent-nonces] update  — PUT the pruned ledger back
+#
+# Deliberately absent, each for a reason:
+#   patch  — the store PUTs the whole object it already holds; get+update is
+#            the complete set the code issues (bin/fc_agent_common.py NonceStore).
+#   list   — would read every ConfigMap in the namespace; the store knows its
+#            own name.
+#   delete — an agent that can delete its own nonce store can erase its own
+#            replay defence.
+#   create — RBAC cannot scope `create` by resourceName (the name does not
+#            exist at admission time), so granting it would hand this identity
+#            namespace-wide ConfigMap creation to buy exactly one object.
+#            install.sh creates that object instead (see the note further
+#            down). If an operator deletes it the
+#            store degrades to in-memory with a warn log +
+#            fc_agent_nonce_store_failures_total — the replay window is then
+#            bounded by the (minutes-long) operation expiry, which is a
+#            documented degradation rather than a widened Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-agent-nonces
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["fc-agent-nonces"]
+    verbs: ["get", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-agent-nonces
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+subjects:
+  - kind: ServiceAccount
+    name: fc-rollout-controller
+    # namespace is set by the kustomize `namespace:` transformer — a
+    # RoleBinding subject is NOT namespaced by that transformer unless the
+    # field is present, so it is written out by install.sh's render.
+roleRef:
+  kind: Role
+  name: fc-agent-nonces
+  apiGroup: rbac.authorization.k8s.io
+
+# ── Where the nonce ledger object itself is ────────────────────────────────
+# NOT here, and not anywhere in the kustomize render — deliberately.
+#
+# The ConfigMap `fc-agent-nonces` is created by install.sh with a
+# create-if-absent, because it is the one object in this package whose CONTENT
+# belongs to the running agent rather than to the install. Shipping it as a
+# declarative resource with `data: {}` means every re-run of `kubectl apply`
+# resets it to empty — which silently erases the single-use replay ledger and
+# re-opens a window that every other check in this design exists to close.
+# Observed on the kind rig, 2026-08-23: the second install.sh run reported
+# `configmap/fc-agent-nonces configured` while nothing else changed.
+#
+# It still carries the package's labels, so uninstall.sh removes it and proves
+# it is gone.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-agent
+  labels:
+    app: fc-agent
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  # Single replica for v1 — plan open question 4 (multiple agents per cluster /
+  # HA) is explicitly left open, because claiming work from a shared queue
+  # needs lease semantics that do not exist yet. The v1 story is "operations
+  # expire, nothing double-executes": an agent that is down leaves its
+  # operations `registered` until `expiresAt`, which surfaces on the gate as
+  # "cluster agent unreachable" rather than silently double-firing later.
+  #
+  # Recreate, not RollingUpdate, so two agents never overlap on the nonce
+  # ConfigMap during a redeploy — and never both poll the same FixControl
+  # queue with the same identity.
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: fc-agent }
+  template:
+    metadata:
+      labels:
+        app: fc-agent
+        app.kubernetes.io/name: fc-agent
+        app.kubernetes.io/part-of: fixcontrol-agent
+    spec:
+      serviceAccountName: fc-rollout-controller
+      automountServiceAccountToken: true
+      # A restart must not race the outgoing pod on the nonce ConfigMap.
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: fc-agent
+          # PLACEHOLDER — never deployed as written. install.sh replaces this
+          # with the digest from values.env via kustomize's `images:`
+          # transformer, and refuses to install a tag-only reference unless
+          # FC_ALLOW_TAG_IMAGES=1 (dev rigs only). See install/README-flow in
+          # the top-level README, Step 17.
+          image: fc-agent:PINNED-BY-INSTALL
+          # Digest references are immutable, so Always would re-pull the same
+          # bytes on every restart for nothing. IfNotPresent is correct
+          # precisely BECAUSE the reference is a digest.
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # Customer-owned policy — allowlists, profiles, intervals. Rendered
+            # by install.sh from base/agent/config-defaults.env + values.env,
+            # so a config change rolls the pod through the generator's content
+            # hash instead of needing a remembered `rollout restart`.
+            - configMapRef: { name: fc-agent-config }
+          env:
+            # Credentials come from the Secret one key at a time so the
+            # manifest documents exactly which secret material exists.
+            - name: FIXCONTROL_URL
+              valueFrom: { secretKeyRef: { name: fc-agent, key: fixcontrol-url } }
+            - name: FIXCONTROL_AGENT_ID
+              valueFrom: { secretKeyRef: { name: fc-agent, key: agent-id } }
+            - name: FIXCONTROL_AGENT_SECRET
+              valueFrom: { secretKeyRef: { name: fc-agent, key: agent-secret } }
+            - name: FIXCONTROL_CLUSTER_ID
+              valueFrom: { secretKeyRef: { name: fc-agent, key: cluster-id } }
+            # Check 1 (tenant_mismatch) is unenforceable without a bound
+            # tenant, so the agent refuses to start without it.
+            - name: FIXCONTROL_TENANT
+              valueFrom: { secretKeyRef: { name: fc-agent, key: tenant } }
+            # Event path keeps the SHIPPED Kubernetes-webhook HMAC contract.
+            # Optional: an agent with EVENTS_ENABLED=0 has no use for it.
+            - name: FIXCONTROL_K8S_SECRET
+              valueFrom:
+                secretKeyRef: { name: fc-agent, key: k8s-webhook-secret, optional: true }
+            # Only needed for PROMOTE_MODE=git.
+            - name: GIT_PROMOTE_CREDENTIAL
+              valueFrom:
+                secretKeyRef: { name: fc-agent, key: git-credential, optional: true }
+            # Only needed for PROMOTE_MODE=receiver.
+            - name: RECEIVER_SECRET
+              valueFrom:
+                secretKeyRef: { name: fc-agent, key: receiver-secret, optional: true }
+            # Phase 3 — the customer's OWN CI host credentials, from a SEPARATE
+            # Secret. Separate for blast radius: `fc-agent` holds the FixControl
+            # identity and the manifests-repo PAT, `fc-agent-ci` holds the
+            # customer's GitLab/Jenkins identity. They are rotated by different
+            # people on different schedules, and an operator reading this
+            # manifest can see at a glance which credential reaches which world.
+            #
+            # The names are the CONVENTION, not a requirement: CI_CONFIG's
+            # `credential_env` names whichever variable is mounted here, so a
+            # second GitLab is a second key.
+            - name: GITLAB_CI_TOKEN
+              valueFrom:
+                secretKeyRef: { name: fc-agent-ci, key: gitlab-token, optional: true }
+            - name: JENKINS_CREDENTIAL
+              valueFrom:
+                secretKeyRef: { name: fc-agent-ci, key: jenkins-credential, optional: true }
+            # The namespace the nonce ConfigMap lives in — the agent's own.
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            # git clone target for PROMOTE_MODE=git + anything git writes to
+            # TMPDIR. Ephemeral on purpose: the marker commit is pushed
+            # immediately and the clone is removed in a `finally`, so nothing
+            # here needs to survive a restart. This mount is also what makes
+            # readOnlyRootFilesystem survivable.
+            - { name: work, mountPath: /tmp }
+            # Internal CA for a private GitLab/Jenkins. install.sh adds this
+            # mount + volume when FC_CI_CA_FILE is set in values.env. Read-only,
+            # and it is the ONLY way to trust an internal CA — the agent has no
+            # "skip TLS verification" knob, because an agent that can be told to
+            # ignore TLS is an agent whose CI credential can be harvested by
+            # anyone on the path.
+          resources:
+            # Sized from the observed idle + burst profile, not from a template.
+            #
+            # requests — the steady state: one poll every POLL_SECONDS, a JSON
+            #   canonicalisation and an Ed25519 verify (~3 ms) per operation.
+            #   CPython's own floor is ~30 MiB RSS; 64 Mi leaves room for the
+            #   urllib buffers and the nonce ledger.
+            # limits.cpu — the burst is `git clone` under PROMOTE_MODE=git plus
+            #   the exec liveness probe, which starts a SECOND interpreter
+            #   inside the same cgroup. 200m was the old value and it is what
+            #   made a 1-second probe timeout fatal on a busy node (kind rig,
+            #   2026-08-21: eight probe timeouts, two restarts, while the agent
+            #   was executing operations normally). 500m absorbs both.
+            # limits.memory — git pack decompression on a manifests repo. A
+            #   large monorepo needs more; this is a knob, not a constant.
+            # ephemeral-storage — the /tmp emptyDir below is capped at 256Mi;
+            #   this bounds the container's writable layer + logs on top of it,
+            #   so a runaway clone evicts this pod and not the node.
+            requests:
+              cpu: "20m"
+              memory: "64Mi"
+              ephemeral-storage: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+              ephemeral-storage: "512Mi"
+          # The health listener binds 127.0.0.1, so an httpGet/tcpSocket probe
+          # (which the kubelet aims at the POD IP) could never reach it. An exec
+          # probe runs inside the pod's network namespace, which keeps the
+          # listener off every routable address AND keeps liveness real.
+          # /healthz reports 503 until the first successful poll, so an agent
+          # that cannot reach FixControl degrades visibly (invariant 9).
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import urllib.request
+                  urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=5)
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            # `timeoutSeconds` is NOT optional here. Its default is 1 second,
+            # which is shorter than the 5 seconds the probe body itself allows
+            # and shorter than a cold Python interpreter start under a busy
+            # node. Must stay above the body's own 5 s and below periodSeconds.
+            timeoutSeconds: 10
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 256Mi }
+# No Service and no Ingress, deliberately. Adding either would re-create the
+# inbound surface this whole design exists to remove. If Prometheus must scrape
+# the agent, prefer a sidecar exporter or flip METRICS_HOST to 0.0.0.0 together
+# with an EXPLICIT ingress NetworkPolicy for the monitoring namespace — never a
+# bare Service.

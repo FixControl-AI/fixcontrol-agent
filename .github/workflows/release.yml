@@ -1,0 +1,124 @@
+# Release the FixControl cluster agent.
+#
+# This workflow lives in the PUBLIC package repository (it is assembled there
+# by `scripts/publish-public-package.sh` in the private rig repo). Pushing a
+# `vX.Y.Z` tag produces everything a customer platform team needs and nothing
+# they have to trust us for:
+#
+#   ghcr.io/<owner>/fc-agent@sha256:…        digest-pinned, cosign-signed
+#   ghcr.io/<owner>/fc-test-runner@sha256:…  digest-pinned, cosign-signed
+#   fixcontrol-agent-X.Y.Z.tar.gz            the install package
+#   fixcontrol-agent-X.Y.Z.tar.gz.sha256     its checksum
+#   image-pins.env                           the two lines values.env wants
+#   image-manifest.json                      digests + SBOM paths per image
+#   *.cdx.json                               CycloneDX SBOMs
+#
+# The asset NAMES are a contract: FixControl's enrolment screen builds these
+# URLs from the version alone (src/server/integrations/devops/agent/release.ts).
+# Renaming one here turns a download button in a customer's console into a 404,
+# so the packaging step asserts them rather than trusting this comment.
+#
+# Signing is keyless (Sigstore/Fulcio) via the workflow's OIDC identity, so
+# there is no signing key to store, rotate or lose. Verification:
+#
+#   cosign verify ghcr.io/<owner>/fc-agent@sha256:… \
+#     --certificate-identity-regexp '^https://github.com/<owner>/<repo>/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (no leading v), for a dry run without a tag"
+        required: true
+
+permissions:
+  contents: write   # create the release and upload assets
+  packages: write   # push to ghcr.io
+  id-token: write   # keyless cosign signing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+          fi
+          # The version ends up in image tags, asset names and a URL the app
+          # builds independently. Anything but plain semver diverges one of
+          # those from the others.
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$version' is not X.Y.Z"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "registry=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, push, sign, SBOM
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          REGISTRY: ${{ steps.v.outputs.registry }}
+          ONLY: fc-agent,fc-test-runner
+        run: ./scripts/build-images.sh
+
+      # A tag-only pin is the one outcome that must never reach a customer:
+      # install.sh refuses it, so a release built without a registry digest
+      # ships a package nobody can install. Fail here, not in their terminal.
+      - name: Assert both images are digest-pinned
+        run: |
+          set -euo pipefail
+          cat build/image-pins.env
+          for var in FC_AGENT_IMAGE FC_TEST_RUNNER_IMAGE; do
+            line="$(grep "^${var}=" build/image-pins.env || true)"
+            [ -n "$line" ] || { echo "::error::${var} missing from image-pins.env"; exit 1; }
+            case "$line" in
+              *@sha256:*) ;;
+              *) echo "::error::${var} is not digest-pinned: $line"; exit 1 ;;
+            esac
+          done
+
+      - name: Package the install tarball
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: ./scripts/package-install.sh
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="Install package and digest-pinned images for fc-agent ${VERSION}.
+
+          Install: download the tarball, verify the checksum, then follow the README.
+          The two \`FC_*_IMAGE\` lines for \`values.env\` are in \`image-pins.env\`."
+          gh release create "v${VERSION}" \
+            --title "fc-agent ${VERSION}" \
+            --notes "$notes" \
+            "build/fixcontrol-agent-${VERSION}.tar.gz" \
+            "build/fixcontrol-agent-${VERSION}.tar.gz.sha256" \
+            "build/image-pins.env" \
+            "build/image-manifest.json" \
+            sbom/*.cdx.json

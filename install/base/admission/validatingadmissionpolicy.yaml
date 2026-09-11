@@ -1,0 +1,145 @@
+---
+# ValidatingAdmissionPolicy — fc-test-runner writes are pinned to `fc-test-*`.
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Why this is IN the package rather than a documented option.              ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# fc-test-runner's ClusterRole is cluster-wide for `namespaces`, `secrets`,
+# `deployments`, `services` and `jobs` — not because it should be, but because
+# Kubernetes RBAC has no name patterns and there is no way to spell "…but only
+# in namespaces matching fc-test-*". Every compensating control up to now was a
+# property of the CODE: the runner derives the namespace name from a sanitised
+# runId and never accepts one from the wire. That is true, and it stops being
+# true the moment someone replaces the code — which is exactly the scenario a
+# platform team is being asked to accept when it runs a component that executes
+# customer test plans.
+#
+# This policy moves the guarantee into the API server. It is the difference
+# between "the runner only writes to fc-test-* namespaces" and "the runner
+# CANNOT write anywhere else". The connectivity plan calls it the single
+# biggest remaining hardening item for fc-test-runner; a package a platform
+# team is meant to trust should not ship with its biggest hardening item marked
+# optional, so it is applied by default (FC_APPLY_ADMISSION_POLICY=1).
+#
+# The two reasons a customer would still turn it off, both legitimate:
+#   · a cluster older than Kubernetes 1.30, where VAP is not GA (install.sh
+#     detects the version and skips with a warning rather than failing);
+#   · a platform team that runs its own policy engine and wants one place for
+#     admission rules — in which case they should transcribe these expressions
+#     into it. install.sh prints them when it skips.
+#
+# It is a NEGATIVE control: it can only refuse. Applying it cannot make the
+# runner do anything new, and removing it cannot break a running install —
+# which is what makes "on by default" a safe default rather than a bold one.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: fc-test-runner-namespace-scope
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      # The cluster-scoped half: which namespaces this identity may bring into
+      # existence, and which it may destroy.
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE", "DELETE"]
+        resources:   ["namespaces"]
+        scope: "Cluster"
+      # The namespaced half: every object the runner creates during a run. This
+      # list is exactly the `create` grants in the ClusterRole — if a grant is
+      # ever added there, it belongs here in the same commit, and
+      # scripts/smoke-rbac-code-parity.py fails until it is.
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["secrets", "services"]
+        scope: "Namespaced"
+      - apiGroups:   ["apps"]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["deployments"]
+        scope: "Namespaced"
+      - apiGroups:   ["batch"]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["jobs"]
+        scope: "Namespaced"
+  matchConditions:
+    # Scope the whole policy to ONE identity. Everything else in the cluster —
+    # the platform team's own tooling, Argo, a human with cluster-admin — is
+    # untouched by this policy, which is why it can be applied without a
+    # cluster-wide impact review.
+    #
+    # install.sh rewrites this expression when the runner is installed into a
+    # namespace other than `fc-test-runner`.
+    - name: only-the-test-runner-identity
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:fc-test-runner:fc-test-runner'
+  variables:
+    # The runner's OWN namespace. It has to be named, because `fc-test-runner`
+    # itself satisfies the `fc-test-` prefix — without this exclusion the
+    # policy would happily let a compromised runner delete the namespace it
+    # lives in, along with its nonce ledger and its credentials.
+    # install.sh rewrites this when the namespace differs.
+    - name: ownNamespace
+      expression: "'fc-test-runner'"
+  validations:
+    - expression: >-
+        request.operation != 'CREATE' ||
+        request.resource.resource != 'namespaces' ||
+        (object.metadata.name.startsWith('fc-test-') &&
+         object.metadata.name != variables.ownNamespace)
+      message: >-
+        fc-test-runner may only create namespaces whose name starts with
+        'fc-test-' (and never its own namespace).
+      reason: Forbidden
+    - expression: >-
+        request.operation != 'CREATE' ||
+        request.resource.resource != 'namespaces' ||
+        (has(object.metadata.labels) &&
+         'fixcontrol.sandbox' in object.metadata.labels &&
+         object.metadata.labels['fixcontrol.sandbox'] == '1' &&
+         'fixcontrol.expires' in object.metadata.labels)
+      message: >-
+        A sandbox namespace must carry fixcontrol.sandbox=1 and
+        fixcontrol.expires — they are what lets ANY runner, including a
+        restarted one, reclaim it. An unlabelled namespace would leak forever.
+      reason: Forbidden
+    - expression: >-
+        request.operation != 'DELETE' ||
+        (request.name.startsWith('fc-test-') && request.name != variables.ownNamespace)
+      message: >-
+        fc-test-runner may only delete namespaces whose name starts with
+        'fc-test-' (and never its own namespace).
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource == 'namespaces' ||
+        (request.namespace.startsWith('fc-test-') &&
+         request.namespace != variables.ownNamespace)
+      message: >-
+        fc-test-runner may only write objects inside an fc-test-* sandbox
+        namespace. This is the cluster-side enforcement of the intent its
+        ClusterRole cannot express.
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: fc-test-runner-namespace-scope
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  policyName: fc-test-runner-namespace-scope
+  # Deny, not Warn/Audit. A policy that only warns leaves the guarantee exactly
+  # where it was — in the code — while reading as if it had moved.
+  validationActions: [Deny]
+  # No matchResources restriction: the policy's own matchConditions already
+  # narrow it to a single ServiceAccount, and narrowing again here by namespace
+  # would be wrong — the whole point is to govern writes to namespaces that do
+  # not exist yet.

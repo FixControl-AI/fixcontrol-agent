@@ -1,0 +1,124 @@
+---
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ THE RUNNER-SIDE CHECKOUT LANE — both objects below are YOURS.            ║
+# ║ This file is an EXAMPLE. It is deliberately NOT in kustomization.yaml.   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# What this enables
+# -----------------
+# A `test.run` whose `workspaceRef.kind` is `"git-remote"`: instead of
+# FixControl packing your workspace into a tarball and this cluster
+# downloading it, the runner CHECKS OUT your repository itself, from your own
+# git remote, at the exact commit the operation names — and then applies a
+# small patch archive on top when the run is validating a proposed change.
+# The source tree never transits FixControl Cloud on that lane.
+#
+# What FixControl sends, and what it does not
+# -------------------------------------------
+# It sends an opaque `repoKey` and a 40-character `commitSha`. It does NOT
+# send — and has no field for — a clone URL or a credential. The mapping from
+# repoKey to URL lives HERE, in an object you create in your own cluster. A
+# repoKey with no entry in this ConfigMap is REFUSED by the runner
+# (`not_allowlisted`, posted back as a result, never a silent drop), exactly
+# the way an unlisted namespace is refused by fc-agent. A FixControl-side bug
+# or compromise that emits "check out something else" cannot name a repository
+# you did not already authorize, and cannot supply a URL at all.
+#
+# Egress
+# ------
+# The runner now also needs egress to your git host. See
+# `FC_EGRESS_TEST_RUNNER_GIT` in install/values.example.env — the runner's
+# NetworkPolicy names its destinations and there is no way to spell
+# 0.0.0.0/0. For most installs the git host is in-cluster or in-network and
+# this is one more ipBlock or namespaceSelector rule.
+#
+# Apply them yourself (they are not in the kustomize base on purpose — a
+# generator would reset your data on every install, and install.sh handling
+# your forge credential would put it in a FixControl-authored values file):
+#
+#   kubectl -n fc-test-runner apply -f customer-git.example.yaml   # after editing
+#
+# or, for the Secret, from a file so the token never reaches a command line:
+#
+#   kubectl -n fc-test-runner create secret generic fc-test-runner-git \
+#     --from-file=acme-ci=/path/to/token.txt
+#
+# External Secrets / Vault / Sealed Secrets own this Secret just as happily:
+# the runner only ever reads the mounted files.
+#
+# One consequence of the labels below, stated so it is not a surprise:
+# `uninstall.sh` sweeps by `app.kubernetes.io/part-of=fixcontrol-agent`, so
+# these two objects go with the install (`--keep-secrets` spares the Secret).
+# Drop the labels if you would rather own their lifecycle entirely — nothing in
+# the runner reads them.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fc-test-runner-repos
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+data:
+  # Mounted at /etc/fc-test-runner/repos/repos.json (REPO_KEYS_FILE).
+  #
+  # Two spellings per entry. Use the string when the remote needs no
+  # credential; use the object when it does.
+  #
+  #   "<repoKey>": "https://…"                     ← unauthenticated remote
+  #   "<repoKey>": {
+  #       "url":           "https://…",            ← REQUIRED, https:// only
+  #       "credentialKey": "<key in the Secret>",  ← optional
+  #       "username":      "<https username>",     ← optional, default
+  #                                                   x-access-token
+  #       "insecure":      true                    ← optional; the ONLY way to
+  #                                                   allow a plaintext http://
+  #                                                   remote, and it means the
+  #                                                   credential travels in
+  #                                                   clear. Prefer https.
+  #   }
+  #
+  # `ssh://` remotes are not served by this runner: supporting them means
+  # shipping an ssh client and a host-key policy into the image, and an https
+  # remote with a token is the same authority with a smaller surface.
+  #
+  # A file that does not parse fails the pod at BOOT (a misconfigured deploy
+  # should be loud). A file that stops parsing later — a bad edit to this
+  # ConfigMap while the runner is up — degrades to "no git-remote lane" with a
+  # loud log line instead of crash-looping a runner that may be mid-run.
+  repos.json: |
+    {
+      "acme-api": {
+        "url": "https://git.internal.example/acme/api.git",
+        "credentialKey": "acme-ci",
+        "username": "fixcontrol-ci"
+      },
+      "acme-docs": "https://git.internal.example/acme/docs.git"
+    }
+
+---
+# The forge credentials. One key per `credentialKey` used above; the VALUE is
+# the token (or app password) and nothing else — no username, no URL.
+#
+# Where it goes, and where it does not: the runner copies exactly the one
+# credential a run needs into that run's own ephemeral Secret, which is mounted
+# by `secretKeyRef` on the checkout initContainer ONLY, and dies with the run
+# namespace. It reaches `git` through GIT_ASKPASS, so it never appears in a
+# remote URL, in `.git/config`, in argv (and therefore never in `ps`), in a log
+# line, or in any evidence posted back to FixControl. The step containers that
+# run your test plan, and the sentinel, never see it.
+#
+# Scope it like a read-only deploy token: this lane clones and checks out. It
+# never pushes.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fc-test-runner-git
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+type: Opaque
+stringData:
+  # REPLACE. Committing a real token to a manifest is the mistake this comment
+  # exists to prevent — prefer the `--from-file` form above, or ESO/Vault.
+  acme-ci: "REPLACE-WITH-A-READ-ONLY-DEPLOY-TOKEN"

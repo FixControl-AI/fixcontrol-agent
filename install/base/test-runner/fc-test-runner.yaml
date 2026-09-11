@@ -1,0 +1,381 @@
+---
+# fc-test-runner — the in-cluster executor for FixControl sandbox environments.
+#
+# Phase 2b of docs/PLAN-multi-container-sandbox-environments.md, delivered over
+# the outbound channel of docs/PLAN-fc-agent-outbound-connectivity.md. This
+# workload dials OUT to FixControl, receives signed `test.run` operations,
+# provisions an ephemeral `fc-test-<runId>` namespace, runs the plan and posts a
+# signed result back. FixControl never dials in and never learns this cluster's
+# API address. There is NO Ingress anywhere in this manifest.
+#
+# THIS IS A KUSTOMIZE BASE — no image digest, and the namespace is the one
+# below unless the render moves it. See install/install.sh.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fc-test-runner
+  labels:
+    app.kubernetes.io/part-of: fixcontrol-agent
+    # Pod Security Admission. The runner pod is `restricted`-conformant
+    # already (non-root, drop ALL, no privilege escalation, RuntimeDefault
+    # seccomp), so enforcing it here costs nothing today and turns a future
+    # regression into an admission failure instead of a quieter privilege.
+    # NOTE this labels only the runner's OWN namespace: the ephemeral
+    # `fc-test-*` namespaces it creates run customer test images and are
+    # governed by the ValidatingAdmissionPolicy in base/admission instead.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fc-test-runner
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+automountServiceAccountToken: true
+
+---
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ RBAC — every rule earns its place, and the one real limit is disclosed.  ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# A ClusterRole is UNAVOIDABLE here and nowhere else: `namespaces` is a
+# cluster-scoped resource, and this component's whole job is creating and
+# deleting ephemeral ones. Everything else it touches is namespaced and would
+# ideally be bound per-namespace — but the namespaces do not exist yet when the
+# binding would have to be written, and creating a RoleBinding per run would
+# require `rolebindings: create`, which is a strictly worse grant than the one
+# it would replace.
+#
+# ── The naming caveat, stated plainly ─────────────────────────────────────
+# **Kubernetes RBAC has no name patterns.** `resourceNames` matches exact names
+# only; there is no way to express "deployments, but only in namespaces matching
+# fc-test-*". The plan's identity table writes the intent as "full manage
+# **within `fc-test-*`**"; RBAC cannot spell that, so the rules below are
+# cluster-wide for those resources.
+#
+# **This package closes that gap.** `install/base/admission` ships a
+# ValidatingAdmissionPolicy that rejects any write by this ServiceAccount whose
+# target namespace does not start with `fc-test-`, and any namespace it creates
+# whose name does not. It is applied by default (FC_APPLY_ADMISSION_POLICY=1)
+# and it turns the caveat from "true because the code says so" into "enforced by
+# the API server even if the code is replaced". The comment stays because the
+# RBAC is still what it is; the policy is what makes it safe.
+#
+# ── EXPLICITLY DENIED (plan §Identities and RBAC) ─────────────────────────
+# Absent from `rules` below, which IS the enforcement — RBAC is deny-by-default.
+# The negative assertions are pinned by install/verify.sh (`kubectl auth can-i`
+# against the live cluster) and by scripts/smoke-rbac-code-parity.py:
+#
+#   · argoproj.io — ANY resource, ANY verb.  ← the load-bearing one: a
+#     compromised test runner must never be able to promote a rollout.
+#   · clusterroles / clusterrolebindings / roles / rolebindings — any verb
+#     (no privilege self-escalation, no minting a wider binding).
+#   · nodes (and nodes/*) — any verb.
+#   · customresourcedefinitions — any verb.
+#   · serviceaccounts/token, users, groups, serviceaccounts — impersonate.
+#   · secrets — every verb except `create`. The runner writes exactly one
+#     Secret per run and reads none, anywhere.
+#
+# ── Grants REMOVED in the packaging pass (2026-08-23), each with evidence ──
+# Every removal below was checked against the complete list of `kube.get(...)`,
+# `kube.post(...)` and `kube.delete(...)` call sites in bin/test-runner.py, and
+# is now pinned by scripts/smoke-rbac-code-parity.py so a future call site
+# without a grant fails the smoke instead of failing in production.
+#
+#   apps/statefulsets           (all verbs) — REMOVED. v1 materialises every
+#     service in a SandboxEnvironmentSpec as a Deployment; there is no
+#     StatefulSet call site. Restore the rule in the same commit that adds one.
+#   configmaps                  (all verbs) — REMOVED from the ClusterRole. The
+#     runner creates no ConfigMap in a run namespace. Its only ConfigMap is the
+#     nonce ledger in its own namespace, which the namespaced Role below covers
+#     by resourceName.
+#   events                      get/list/watch — REMOVED. No call site. The
+#     failure diagnosis path reads pod status and pod logs, not Events.
+#   apps/replicasets            get/list/watch — REMOVED. No call site.
+#   pods/status                 get/list/watch — REMOVED. Image digests come
+#     from `.status.containerStatuses[].imageID` on the pod object itself
+#     (covered by `pods: list`); the status subresource is never addressed.
+#   namespaces                  watch  — REMOVED. The TTL sweeper LISTs by
+#     label every poll cycle; nothing watches.
+#   deployments/services/jobs   watch, and the write verbs beyond what is
+#     called — REMOVED. Deleting the run namespace garbage-collects everything
+#     inside it, so no per-object `delete` is needed and none is issued.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fc-test-runner
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+rules:
+  # namespaces — the reason this is a ClusterRole at all.
+  #   create → the ephemeral environment for a run
+  #   delete → the `finally` teardown AND the TTL sweeper's reclaim
+  #   list   → the sweeper's selection pass
+  #            (?labelSelector=fixcontrol.sandbox=1)
+  #   get    → confirming a teardown actually took effect
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "delete"]
+
+  # The workload objects that make up a sandbox environment. CREATE only: the
+  # run namespace is deleted as a whole, and Kubernetes garbage-collects its
+  # contents, so nothing here ever needs to be individually read or removed.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create"]
+
+  # The test Job.
+  #   create → materialise the plan
+  #   get    → poll it to completion / read its failure condition
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get"]
+
+  # Secrets: CREATE, and nothing else. The runner makes exactly one Secret per
+  # run (the agent credential copy mounted on the `fetch` initContainer) and
+  # reads no Secret anywhere. Because the naming caveat above forces these
+  # rules to be cluster-wide, granting `get`/`list`/`watch` here would let this
+  # identity read EVERY Secret in the cluster — verified on the kind rig
+  # 2026-08-21, where `kubectl auth can-i get secrets -n kube-system` answered
+  # **yes**, which acceptance criterion 5 requires to be **no**.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+
+  # Read-only observation.
+  #   pods list  → readiness polling and image-digest collection
+  #                (`.status.containerStatuses[].imageID`, invariant 7). Every
+  #                pod read in bin/test-runner.py is a label/field-selected
+  #                LIST; `get` was granted alongside it out of habit and is
+  #                removed — scripts/smoke-rbac-code-parity.py caught it.
+  #   pods/log   → the step logs that become the masked run evidence
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+# The persisted nonce store lives in ONE ConfigMap in this runner's own
+# namespace. Namespaced, and by resourceName, so the write verb exists for
+# exactly one object in exactly one namespace.
+#
+# The namespace-wide `create` this Role used to carry is GONE: the ConfigMap is
+# shipped below instead, exactly as fc-agent does it. `create` cannot carry a
+# resourceName, so granting it bought namespace-wide ConfigMap creation for one
+# object. If an operator deletes the object the store degrades to in-memory
+# with a warn log, and the replay window is bounded by the operation expiry.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-test-runner-nonces
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["fc-test-runner-nonces"]
+    verbs: ["get", "update"]
+
+# The ledger object `fc-test-runner-nonces` is created by install.sh with a
+# create-if-absent rather than shipped here, for the reason spelled out in
+# install/base/agent/fc-agent.yaml: a declarative `data: {}` would reset the
+# replay ledger on every re-apply.
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-test-runner-nonces
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+subjects:
+  - kind: ServiceAccount
+    name: fc-test-runner
+    namespace: fc-test-runner
+roleRef:
+  kind: Role
+  name: fc-test-runner-nonces
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fc-test-runner
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+subjects:
+  - kind: ServiceAccount
+    name: fc-test-runner
+    namespace: fc-test-runner
+roleRef:
+  kind: ClusterRole
+  name: fc-test-runner
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-test-runner
+  labels:
+    app: fc-test-runner
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/component: test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  # Single replica, deliberately. Two runners would both claim operations, and
+  # operation claim/lease semantics are open question 4 of the connectivity
+  # plan — until it is answered, "operations expire, nothing double-executes"
+  # is the v1 story and one replica is what makes it true.
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: fc-test-runner }
+  template:
+    metadata:
+      labels:
+        app: fc-test-runner
+        app.kubernetes.io/name: fc-test-runner
+        app.kubernetes.io/part-of: fixcontrol-agent
+    spec:
+      serviceAccountName: fc-test-runner
+      # Unlike fc-signer, this one needs the SA token: it IS the Kubernetes API
+      # client. That is the whole reason the RBAC above is written as tightly
+      # as RBAC allows.
+      automountServiceAccountToken: true
+      # A SIGKILLed runner leaves its run namespace behind; the TTL sweeper
+      # reclaims it on the next cycle either way, but a graceful stop lets the
+      # in-flight `finally` delete it immediately.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: test-runner
+          # PLACEHOLDER — install.sh replaces this with the digest from
+          # values.env, and sets the RUNNER_IMAGE ConfigMap key to the SAME
+          # reference (the runner uses it for the Job's fetch + sentinel
+          # containers). install/verify.sh asserts the two match.
+          image: fc-test-runner:PINNED-BY-INSTALL
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:    { name: fc-test-runner }
+            - configMapRef: { name: fc-test-runner-config }
+          env:
+            # Where the persisted nonce store lives — read from the downward
+            # API rather than hard-coded, so a re-namespaced install still
+            # writes its ledger next to itself.
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          ports:
+            - { containerPort: 8080, name: http, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            # readOnlyRootFilesystem needs somewhere for Python's scratch
+            # writes and the log excerpts it buffers before posting.
+            - { name: tmp, mountPath: /tmp }
+            # ── The runner-side checkout lane (BOTH CUSTOMER-OWNED) ─────────
+            # Only used by `workspaceRef.kind: "git-remote"`, where this
+            # cluster clones YOUR repository at an exact commit and the source
+            # tree never transits FixControl Cloud. Both mounts are
+            # `optional: true`: an install that only ever receives
+            # `channel-tar` workspaces creates neither object, the runner then
+            # advertises only `channel-tar` on every poll, and any git-remote
+            # operation it is nevertheless handed is refused locally.
+            #
+            # See customer-git.example.yaml next to this file for the two
+            # objects and their exact shape. install.sh does NOT create them:
+            # the repo URLs are your topology and the credential is yours, so
+            # neither belongs in a FixControl-authored values file.
+            - { name: repo-keys, mountPath: /etc/fc-test-runner/repos, readOnly: true }
+            - { name: git-credentials, mountPath: /etc/fc-test-runner/git, readOnly: true }
+          resources:
+            # requests — the steady state is a poll loop plus, during a run,
+            #   readiness polling and log collection against the API server.
+            #   50m/96Mi covers the interpreter plus the largest buffered log
+            #   excerpt the result contract allows.
+            # limits — a run's peak is JSON-encoding the whole evidence set
+            #   (per-step results, masked logs, the service→digest map) while
+            #   still polling. 500m/256Mi has absorbed every run on the kind
+            #   rig; raise memory first if a customer's plans produce very
+            #   large logs, since that is the dimension that grows.
+            # ephemeral-storage — bounds the writable layer + the /tmp emptyDir
+            #   below, so a pathological log stream evicts this pod rather than
+            #   filling the node's disk under every other workload.
+            requests:
+              cpu: "50m"
+              memory: "96Mi"
+              ephemeral-storage: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+              ephemeral-storage: "512Mi"
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 128Mi }
+        # `optional: true` on both, deliberately: a missing object leaves the
+        # mount point empty instead of leaving the pod stuck in
+        # ContainerCreating. The runner reads these paths at USE time, so
+        # creating the ConfigMap later starts the git-remote lane on the next
+        # poll — no rollout, no restart.
+        - name: repo-keys
+          configMap:
+            name: fc-test-runner-repos
+            optional: true
+        - name: git-credentials
+          secret:
+            secretName: fc-test-runner-git
+            optional: true
+            # Read-only to the runner uid and to nothing else in the pod.
+            defaultMode: 0400
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-test-runner
+  labels:
+    app: fc-test-runner          # matched by the ServiceMonitor in observability.yaml
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  selector: { app: fc-test-runner }
+  ports:
+    - { name: http, port: 80, targetPort: 8080, protocol: TCP }
+  type: ClusterIP
+# This Service exists for ONE reason: a Prometheus scrape of /metrics, which
+# the ingress NetworkPolicy restricts to a monitoring namespace. It is a
+# ClusterIP and it must stay one — the runner's outbound-only promise does not
+# survive a NodePort or a LoadBalancer here.

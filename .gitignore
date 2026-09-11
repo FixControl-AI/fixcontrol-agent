@@ -1,0 +1,12 @@
+# The customer's own values (secrets) and the generated render.
+install/values.env
+install/values*.env
+!install/values.example.env
+install/.render/
+
+# build-images.sh / package-install.sh outputs
+build/
+sbom/
+
+__pycache__/
+*.pyc

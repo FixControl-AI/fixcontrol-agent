@@ -1,0 +1,26 @@
+---
+# default-deny for the agent's namespace.
+#
+# Shipped as its OWN base directory rather than alongside the agent, because
+# whether it may be applied depends on something the package cannot know: who
+# else lives in that namespace. In a dedicated FixControl-agent namespace
+# (the recommended install, and the default in values.example.env) it is
+# unconditionally correct and install.sh applies it. Dropped into a namespace
+# that already runs the customer's own workloads it would blackhole them, so
+# FC_APPLY_DEFAULT_DENY=0 skips it and the platform team's own baseline policy
+# is expected to cover the namespace instead.
+#
+# Note what this does and does not do. It denies both directions for EVERY pod
+# in the namespace; `fc-agent-egress` then re-allows the agent's named
+# destinations. There is deliberately no companion ingress allow — the agent
+# has no listener anything should reach.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    app.kubernetes.io/name: fc-agent
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]

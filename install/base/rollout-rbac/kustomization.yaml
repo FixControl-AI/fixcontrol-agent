@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Applied once PER ROLLOUT NAMESPACE. install.sh renders one nested
+# kustomization per entry in FC_ROLLOUT_NAMESPACES, each setting
+# `namespace: <that namespace>` and patching the RoleBinding subject back to
+# the agent's own namespace.
+
+resources:
+  - rollout-rbac.yaml

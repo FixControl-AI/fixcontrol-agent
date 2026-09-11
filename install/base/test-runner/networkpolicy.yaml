@@ -1,0 +1,109 @@
+---
+# default-deny for the runner's own namespace. Unconditional here, unlike the
+# agent's: this package OWNS the fc-test-runner namespace, so nothing else can
+# be blackholed by it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+# Ingress: Prometheus /metrics scrape only. No other pod, and nothing outside
+# the cluster, has any reason to reach this workload. "Firewall requirement,
+# inbound: none" is the product promise this component exists to keep.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fc-test-runner-ingress
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  podSelector:
+    matchLabels: { app: fc-test-runner }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+        - namespaceSelector:
+            matchLabels: { monitoring: "true" }
+      ports:
+        - { protocol: TCP, port: 8080 }
+
+---
+# Egress floor: cluster DNS + the kube-apiserver. install.sh REPLACES
+# `spec.egress` with this plus the FixControl destination from values.env — the
+# same total-replacement contract as the agent's policy, for the same reason:
+# what you read in the render is exactly what is applied.
+#
+# ── The runner-side checkout lane does NOT widen THIS policy ───────────────
+# `workspaceRef.kind: "git-remote"` (install/base/test-runner/
+# customer-git.example.yaml) adds one egress destination to the system: YOUR
+# git host. But the pod that clones is the run Job's checkout initContainer,
+# and that pod lives in the ephemeral `fc-test-<runId>` namespace — not here.
+# This policy selects `app: fc-test-runner`, i.e. the runner Deployment, which
+# resolves the repoKey from a mounted ConfigMap and never runs git itself.
+# Adding a git rule here would be authority nothing uses.
+#
+# Where it DOES matter is the note at the bottom of this file: see it before
+# you enable the lane under a cluster-wide default-deny.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fc-test-runner-egress
+  labels:
+    app.kubernetes.io/name: fc-test-runner
+    app.kubernetes.io/part-of: fixcontrol-agent
+spec:
+  podSelector:
+    matchLabels: { app: fc-test-runner }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock: { cidr: 10.96.0.1/32 }
+      ports:
+        - { protocol: TCP, port: 443 }
+
+# ── The ephemeral run namespaces ──────────────────────────────────────────
+# Their policies cannot be applied ahead of time from this file: the namespaces
+# are created at runtime. The isolation there is structural — services get no
+# egress path they could use, the Job's step containers reach only the
+# services' headless DNS names in their own namespace, and the ONLY pod in a
+# run namespace that leaves the cluster is the workspace initContainer:
+#
+#   `fetch`     (workspaceRef.kind: channel-tar) → FixControl, and nothing else.
+#   `checkout`  (workspaceRef.kind: git-remote)  → YOUR git host, plus
+#               FixControl only when the run also carries a patch archive.
+#
+# THE EGRESS IMPLICATION OF THE CHECKOUT LANE, STATED PLAINLY: enabling
+# `git-remote` means the ephemeral `fc-test-*` namespaces must be able to reach
+# your git host. Usually that is in-cluster or in-network and a cluster-wide
+# baseline already permits it; if your baseline is default-deny with per-
+# namespace allows, add the git host (and FixControl, which the tar lane
+# already needed) for namespaces matching `fc-test-*`, or the checkout fails
+# closed with a git network error. Failing closed is the correct behaviour —
+# it is not a bug report.
+#
+# A cluster-wide default-deny baseline (which a platform team running sandboxed
+# customer code should have anyway) covers them completely. Automating a
+# per-run-namespace default-deny needs something that can CREATE an object in
+# reaction to a namespace appearing: a policy engine's generate rule (Kyverno),
+# or a `networkpolicies: create` grant on the runner plus a code change. Both
+# are documented in the README's "Operate" section; neither is shipped here,
+# because adding a policy-engine dependency to this package would be a bigger
+# imposition on the platform team than the gap it closes.

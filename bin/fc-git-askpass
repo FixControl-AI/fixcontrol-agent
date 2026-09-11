@@ -1,0 +1,26 @@
+#!/bin/sh
+# fc-git-askpass — the ONLY path by which a git credential reaches `git`.
+#
+# git invokes $GIT_ASKPASS with the prompt as $1 and reads the answer from
+# stdout. That is the whole point of using it here: the credential travels
+# process → pipe → git, so it never appears
+#
+#   · in a remote URL      (and therefore never in .git/config, never in a
+#                           git error message, never in a log line),
+#   · in argv              (and therefore never in `ps`, never in a
+#                           process-listing sidecar, never in a crash dump of
+#                           the command line),
+#   · on disk              (no credential store file to write, chmod and
+#                           forget to delete).
+#
+# The values come from FC_GIT_USERNAME / FC_GIT_PASSWORD, which
+# bin/test-runner.py sets on the `git` subprocess only — they are not part of
+# the container's declared environment beyond the single Secret key the
+# checkout initContainer is given.
+#
+# Printing anything else here — a banner, a debug line — would corrupt the
+# answer git reads. There is deliberately nothing else in this file.
+case "$1" in
+  Username*|username*) printf '%s' "${FC_GIT_USERNAME:-}" ;;
+  *)                   printf '%s' "${FC_GIT_PASSWORD:-}" ;;
+esac

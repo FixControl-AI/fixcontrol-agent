@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - fc-test-runner.yaml
+  - networkpolicy.yaml
+
+# customer-git.example.yaml is NOT a resource, deliberately. It documents the
+# two CUSTOMER-OWNED objects of the runner-side checkout lane (the repoKey →
+# clone-URL ConfigMap and the forge-credential Secret). Rendering them here
+# would have every `install.sh` overwrite a customer's repo map with an example,
+# and would put a forge credential in a FixControl-authored file. The Deployment
+# mounts both with `optional: true`, so an install that never creates them is a
+# runner that simply does not advertise the `git-remote` workspace kind.
