@@ -33,7 +33,9 @@ Download the tarball from [the latest release](../../releases/latest), verify
 it, and unpack it:
 
 ```sh
-VERSION=1.0.3            # the release you are installing
+# The newest release, or set VERSION by hand to pin an older one.
+VERSION=$(curl -fsSL https://api.github.com/repos/FixControl-AI/fixcontrol-agent/releases/latest \
+          | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 base="https://github.com/FixControl-AI/fixcontrol-agent/releases/download/v${VERSION}"
 
 curl -fsSLO "${base}/fixcontrol-agent-${VERSION}.tar.gz"
