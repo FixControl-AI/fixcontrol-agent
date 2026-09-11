@@ -34,7 +34,7 @@ it, and unpack it:
 
 ```sh
 VERSION=1.0.3            # the release you are installing
-base="https://github.com/Alexander-Fix-Control-AI/fixcontrol-agent/releases/download/v${VERSION}"
+base="https://github.com/FixControl-AI/fixcontrol-agent/releases/download/v${VERSION}"
 
 curl -fsSLO "${base}/fixcontrol-agent-${VERSION}.tar.gz"
 curl -fsSLO "${base}/fixcontrol-agent-${VERSION}.tar.gz.sha256"
@@ -53,7 +53,7 @@ curl -fsSLO "${base}/image-pins.env"     # the two digest-pinned lines values.en
 . ./image-pins.env
 
 cosign verify "$FC_AGENT_IMAGE" \
-  --certificate-identity-regexp '^https://github.com/Alexander-Fix-Control-AI/fixcontrol-agent/' \
+  --certificate-identity-regexp '^https://github.com/FixControl-AI/fixcontrol-agent/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
