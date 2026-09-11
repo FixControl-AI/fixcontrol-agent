@@ -72,7 +72,9 @@ for path in "${REQUIRED[@]}"; do
   mkdir -p "$STAGE/$(dirname "$path")"
   cp -R "$path" "$STAGE/$path"
 done
-[[ -e LICENSE ]] && cp LICENSE "$STAGE/LICENSE"
+# `[[ … ]] && cp` would be the last command of a failing compound under
+# `set -e` when there is no LICENSE, which is a legal state.
+if [[ -e LICENSE ]]; then cp LICENSE "$STAGE/LICENSE"; fi
 
 # Generated state that must never travel: a rendered overlay from someone
 # else's cluster, and Python bytecode.
@@ -98,6 +100,9 @@ done
 
 echo "wrote $TARBALL"
 cat "${TARBALL}.sha256"
-tar -tzf "$TARBALL" | head -20
+# `| head` closes the pipe early, SIGPIPEs tar, and under `set -o pipefail`
+# fails a release for a listing that succeeded. `sed -n` reads to the end.
+entries="$(tar -tzf "$TARBALL")"
+echo "$entries" | sed -n '1,20p'
 echo "…"
-echo "$(tar -tzf "$TARBALL" | wc -l) entries"
+echo "$(echo "$entries" | wc -l) entries"
