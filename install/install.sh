@@ -789,7 +789,15 @@ apply_secret() {  # apply_secret <namespace> <name> <key=value> ...
         app.kubernetes.io/managed-by=fixcontrol-install \
     | { [[ "$DRY_RUN" == "1" ]] && kubectl apply --dry-run=server -f - >/dev/null || kubectl apply -f - >/dev/null; }
   rm -rf "$SECRET_TMP"; SECRET_TMP=""
-  note "secret $ns/$name applied (${#args[@]} keys)"
+  # Say which of the two just happened. The line used to read "applied" in
+  # both modes, which tells an operator running --dry-run that they have just
+  # overwritten a live credential — in an installer whose stated contract for
+  # that flag is that it writes nothing.
+  if [[ "$DRY_RUN" == "1" ]]; then
+    note "(dry-run) secret $ns/$name would be applied (${#args[@]} keys)"
+  else
+    note "secret $ns/$name applied (${#args[@]} keys)"
+  fi
 }
 
 require_secret_keys() {  # require_secret_keys <ns> <name> <key> ...
@@ -807,7 +815,7 @@ require_secret_keys() {  # require_secret_keys <ns> <name> <key> ...
 
 if [[ "$FC_INSTALL_AGENT" == "1" ]]; then
   if [[ "$FC_MANAGE_SECRETS" == "1" ]]; then
-    step "Applying agent credentials"
+    step "$([[ "$DRY_RUN" == "1" ]] && echo "Agent credentials (dry-run)" || echo "Applying agent credentials")"
     apply_secret "$FC_AGENT_NAMESPACE" fc-agent \
       "fixcontrol-url=$FC_URL" \
       "agent-id=$FC_AGENT_ID" \
